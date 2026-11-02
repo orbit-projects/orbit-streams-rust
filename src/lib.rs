@@ -1,4 +1,10 @@
 //! Rust SDK for bounded Orbit stream batches and Core-supervised process plugins.
+//!
+//! The crate validates the language-neutral `orbit.streams.v1` request and response bounds and
+//! can host a synchronous [`BatchProcessor`] behind Core's supervised local gRPC process
+//! protocol. It does not provide broker clients, queue semantics, durable delivery, or retries.
+//! Applications own processor policy and choose Python or Rust explicitly. The local process
+//! boundary is for trusted same-user code and does not sandbox processor implementations.
 
 pub mod plugin;
 
@@ -17,12 +23,51 @@ pub mod proto {
 
 pub use proto::streams_v1::{StreamBatch, StreamRecord};
 
-/// Hard limits shared with the provider-neutral Python package.
+/// Maximum record value size shared with the provider-neutral Python package.
 pub const MAX_RECORD_BYTES: usize = 256 * 1024;
+/// Maximum aggregate record field bytes allowed in one batch.
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
+/// Maximum number of records in one batch.
 pub const MAX_RECORDS_PER_BATCH: usize = 1024;
+/// Maximum headers on a record.
 pub const MAX_HEADERS: usize = 16;
+/// Maximum combined encoded header name and value bytes on one record.
 pub const MAX_HEADER_BYTES: usize = 4096;
+/// Default maximum number of concurrent Core capability calls handled by the plugin runtime.
+pub const DEFAULT_MAX_IN_FLIGHT_CALLS: usize = 16;
+/// Hard upper bound for concurrent plugin calls, keeping queued batch memory bounded.
+pub const MAX_IN_FLIGHT_CALLS: usize = 16;
+
+/// Resource policy for one supervised stream processor process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginOptions {
+    max_in_flight_calls: usize,
+}
+
+impl PluginOptions {
+    /// Construct a bounded call-concurrency policy.
+    pub fn new(max_in_flight_calls: usize) -> Result<Self, StreamError> {
+        if !(1..=MAX_IN_FLIGHT_CALLS).contains(&max_in_flight_calls) {
+            return Err(StreamError::LimitExceeded);
+        }
+        Ok(Self {
+            max_in_flight_calls,
+        })
+    }
+
+    /// Return the maximum number of batches this process may execute at once.
+    pub fn max_in_flight_calls(self) -> usize {
+        self.max_in_flight_calls
+    }
+}
+
+impl Default for PluginOptions {
+    fn default() -> Self {
+        Self {
+            max_in_flight_calls: DEFAULT_MAX_IN_FLIGHT_CALLS,
+        }
+    }
+}
 
 /// A bounded stream SDK validation error. Error values never include record payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +89,12 @@ impl std::fmt::Display for StreamError {
 
 impl std::error::Error for StreamError {}
 
-/// Validate a capability request or response using the Python contract's hard bounds.
+/// Validate a capability request or response using the shared Python/Rust contract bounds.
+///
+/// The batch's declared limits must themselves be non-zero and no greater than the hard package
+/// ceilings. The function checks all record fields, aggregate field bytes, identifiers, header
+/// count/size, and timestamps. It does not estimate Protobuf framing bytes or impose broker
+/// delivery semantics.
 pub fn validate_batch(batch: &StreamBatch) -> Result<(), StreamError> {
     let count = batch.records.len();
     let max_records = batch.max_records as usize;
@@ -121,6 +171,11 @@ fn validate_record(record: &StreamRecord) -> Result<(), StreamError> {
 }
 
 /// User-defined synchronous batch transform implemented with the Rust SDK.
+///
+/// `process` runs on a blocking worker thread and is called concurrently up to 16 times by the
+/// process runtime. Implementations must be thread-safe. Keep state synchronization bounded and
+/// do not block indefinitely; Core owns request deadlines and process shutdown. Returned batches
+/// are validated again before the runtime serializes them to Core.
 pub trait BatchProcessor: Send + Sync + 'static {
     /// Called once after Core sends its validated JSON configuration.
     fn activate(&self, _configuration_json: &[u8]) -> Result<(), ProcessorFailure> {
@@ -128,6 +183,9 @@ pub trait BatchProcessor: Send + Sync + 'static {
     }
 
     /// Transform or filter one validated bounded batch. The caller owns delivery semantics.
+    ///
+    /// Preserve `max_records` and `max_bytes` from the input. Return a batch that passes
+    /// [`validate_batch`]; invalid output is reported to Core as a bounded capability error.
     fn process(&self, batch: StreamBatch) -> Result<StreamBatch, ProcessorFailure>;
 
     /// Called before Core's process host shuts down.
@@ -206,5 +264,14 @@ mod tests {
             validate_batch(&batch(vec![invalid])),
             Err(StreamError::InvalidRecord)
         );
+    }
+
+    #[test]
+    fn plugin_options_allow_lower_bounded_concurrency() {
+        assert_eq!(PluginOptions::default().max_in_flight_calls(), 16);
+        assert_eq!(PluginOptions::new(1).unwrap().max_in_flight_calls(), 1);
+        assert_eq!(PluginOptions::new(8).unwrap().max_in_flight_calls(), 8);
+        assert_eq!(PluginOptions::new(0), Err(StreamError::LimitExceeded));
+        assert_eq!(PluginOptions::new(17), Err(StreamError::LimitExceeded));
     }
 }

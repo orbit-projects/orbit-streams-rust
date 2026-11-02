@@ -26,7 +26,9 @@ cargo build --release --locked --example append_plugin
 `cargo run --release --example append_plugin` starts a Core process plugin. Its configuration is
 `{"suffix":"..."}`. A Rust application can implement `BatchProcessor` and pass it to
 `orbit_streams_rust::plugin::run`. The demo refuses values that would cross the shared 256 KiB
-record limit.
+record limit. `run` defaults to 16 concurrent batches; use `run_with_options` with
+`PluginOptions::new(1..=16)` to lower memory and CPU pressure for processors whose batches retain
+large working sets. This is a resource bound, not a latency optimization guarantee.
 
 To compare equivalent Python and Rust transforms through the real Core host, install `orbit-core`
 with `process-plugins`, install `orbit-streams`, build the example in release mode, then run:
@@ -69,9 +71,11 @@ privileges.
 
 The capability schema is mirrored from `orbit-streams/proto/orbit/streams/v1/stream_processing.proto`;
 the lifecycle schema is mirrored from Core's `process_plugin.proto`. Generated code is built from
-the checked-in schemas. Protocol compatibility, Python/Rust conformance, hosted CI, supply-chain
-provenance, and representative performance characterization remain release gates. This is a
-pre-release implementation, not a production certification.
+the checked-in schemas. This is a **v0.1.0-alpha review candidate**. On Rust 1.85.0 and stable,
+local formatting, all four tests, Clippy with warnings denied, and the locked release plugin build
+pass. Protocol compatibility, Python/Rust conformance, hosted CI, supply-chain provenance, and
+representative performance characterization remain open release gates. The alpha status is not a
+production certification.
 
 Licensed under Apache-2.0.
 

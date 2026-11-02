@@ -1,6 +1,6 @@
 //! Core process-host connection and bounded stream capability dispatch.
 
-use crate::{BatchProcessor, ProcessorFailure, StreamBatch, validate_batch};
+use crate::{BatchProcessor, PluginOptions, ProcessorFailure, StreamBatch, validate_batch};
 use prost::Message;
 use prost_types::Any;
 use proto::plugin_v1::{
@@ -24,7 +24,6 @@ use crate::proto;
 const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_BYTES: usize = 1088 * 1024;
-const MAX_IN_FLIGHT_CALLS: usize = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +59,18 @@ struct RuntimeState {
 /// Core owns child supervision, configuration delivery, authentication, health probes, and
 /// shutdown. The process transport is trusted same-user loopback and is not a sandbox.
 pub async fn run<P: BatchProcessor>(processor: Arc<P>) -> Result<(), &'static str> {
+    run_with_options(processor, PluginOptions::default()).await
+}
+
+/// Run a Core-supervised processor with an explicit bounded concurrency policy.
+///
+/// Lower the default of 16 when each batch retains substantial application state or the host
+/// process has a small memory/CPU budget. The setting only limits Rust-side concurrent work; Core
+/// may have a higher host limit, in which case the gRPC stream applies backpressure.
+pub async fn run_with_options<P: BatchProcessor>(
+    processor: Arc<P>,
+    options: PluginOptions,
+) -> Result<(), &'static str> {
     let bootstrap = read_bootstrap().map_err(|_| "invalid Orbit plugin bootstrap")?;
     validate_bootstrap(&bootstrap)?;
     let endpoint = Endpoint::from_shared(format!("http://{}", bootstrap.endpoint))
@@ -68,7 +79,8 @@ pub async fn run<P: BatchProcessor>(processor: Arc<P>) -> Result<(), &'static st
         .connect()
         .await
         .map_err(|_| "could not connect to Orbit Core")?;
-    let (sender, receiver) = mpsc::channel::<PluginFrame>(MAX_IN_FLIGHT_CALLS + 2);
+    let max_in_flight_calls = options.max_in_flight_calls();
+    let (sender, receiver) = mpsc::channel::<PluginFrame>(max_in_flight_calls + 2);
     let mut request = Request::new(ReceiverStream::new(receiver));
     let bearer = format!("Bearer {}", bootstrap.token);
     let bearer_value =
@@ -104,7 +116,7 @@ pub async fn run<P: BatchProcessor>(processor: Arc<P>) -> Result<(), &'static st
         .into_inner();
 
     let state = Arc::new(RwLock::new(RuntimeState { active: false }));
-    let slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_CALLS));
+    let slots = Arc::new(Semaphore::new(max_in_flight_calls));
     let mut calls = JoinSet::new();
     let result = async {
         while let Some(frame) = response

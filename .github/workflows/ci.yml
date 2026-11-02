@@ -10,19 +10,25 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install protobuf compiler
         run: |
           sudo apt-get update
           sudo apt-get install --yes protobuf-compiler
-      - name: Install Rust stable
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Install Rust ${{ matrix.rust }}
+        run: rustup toolchain install '${{ matrix.rust }}' --profile minimal --component rustfmt --component clippy
       - name: Check formatting
-        run: cargo +stable fmt --check
+        run: cargo +${{ matrix.rust }} fmt --check
       - name: Test
-        run: cargo +stable test --locked --all-targets
+        run: cargo +${{ matrix.rust }} test --locked --all-targets
       - name: Lint
-        run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo +${{ matrix.rust }} clippy --locked --all-targets --all-features -- -D warnings
       - name: Build release plugin example
-        run: cargo +stable build --release --locked --example append_plugin
+        run: cargo +${{ matrix.rust }} build --release --locked --example append_plugin

@@ -1,47 +1,53 @@
-# Orbit Streams Rust: operations and security
+# Operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+The Rust package provides a processor runtime, not a stream broker integration. It consumes one
+validated batch per Core capability request and returns a transformed or filtered batch. It does
+not poll brokers, acknowledge messages, persist offsets, retry failures, checkpoint state, or
+guarantee ordering or exactly-once delivery. The surrounding application or a separate broker
+adapter owns those semantics.
 
-## Configuration surface
+## Processor contract
 
-Environment names found in the package README:
+Implement `BatchProcessor` and pass it to `orbit_streams_rust::plugin::run`. `activate` receives
+Core's JSON configuration after the process handshake; `process` receives ownership of one
+validated `StreamBatch`; `deactivate` runs before normal process shutdown. The processor is
+synchronous and executes on a blocking worker thread. Calls may run concurrently up to 16, so
+shared processor state must be thread-safe. Avoid unbounded blocking and coordinate long-running
+work with the host's request deadlines.
 
-- `ORBIT_STREAMS_RUST_PLUGIN`
+Return a batch with the same `max_records` and `max_bytes` declarations as its input. Both the
+input and output are validated, including identifiers, timestamp, content type, header limits,
+record count, value size, and aggregate bytes. Invalid output becomes a sanitized capability error.
 
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
+## Core process setup
 
-## Lifecycle, failure behavior, and limits
+Build an executable with a fixed absolute path. Configure Core's `ProcessPlugin` with the matching
+name, `orbit.streams` capability, and JSON configuration; Core sends configuration after the
+authenticated process handshake rather than through command-line arguments. The plugin reads one
+bounded bootstrap record from stdin and connects only to the supplied loopback endpoint. Core owns
+process startup, configuration, health, deadlines, and shutdown.
 
-`orbit-streams-rust` is the Rust implementation of the provider-neutral stream-processing
-capability also implemented by Python `orbit-streams`. It executes the application's compiled
-batch processor itself inside a Core-supervised process. Choose it for CPU-heavy or memory-sensitive
-transforms after comparing the complete process path; Python remains the direct in-process option.
-Applications select and configure one implementation explicitly.
+The README's `append_plugin` example accepts a `suffix` JSON setting. Its benchmark compares
+Python in-process calls against Rust through the process boundary. Repeat runs on a quiet machine
+and vary payload size, record count, concurrency, operation, and process startup. Treat these
+results as local measurements, not broker capacity guarantees.
 
-The implementation provides generated typed Protobuf messages, bounded batch validation, a
-`BatchProcessor` contract, and a Core-supervised local gRPC runtime. It transforms each bounded
-batch concurrently up to 16 calls, with backpressure beyond that bound. Core owns child lifecycle,
-configuration, health, authentication, and shutdown. The process boundary is trusted same-user
-loopback, not a sandbox. This package does not provide broker clients, durable delivery,
-acknowledgements, checkpoints, retries, or exactly-once semantics.
+## Capacity and shutdown
 
-## Performance and safety
+The runtime allows up to 16 capability calls in flight and uses a bounded channel for backpressure.
+Input/output batches are limited to 1,024 records, 256 KiB per value, and 1 MiB aggregate record
+field data; header and identifier limits apply per record. Size upstream batches so their encoded
+Protobuf representation also fits the host's message limit.
 
-Rust can reduce per-record transformation overhead for suitable CPU-bound processors. The local
-gRPC call, Protobuf encoding, copying, process scheduling, and Python conversion also cost time;
-this SDK does not claim that Rust is faster end to end. Benchmark with the application's batch size,
-payload distribution, transformation, process lifetime, and serialization included. Avoid sending
-secrets through record representations or logs. Processor code has the host application's OS
-privileges.
+On lifecycle transitions the runtime drains active calls before activation changes. During normal
+shutdown, Core owns child termination and process cleanup. Make processor deactivation bounded
+and do not rely on abrupt process termination to flush application state; this package provides
+no durable state or flush guarantee.
 
-The capability schema is mirrored from `orbit-streams/proto/orbit/streams/v1/stream_processing.proto`;
-the lifecycle schema is mirrored from Core's `process_plugin.proto`. Generated code is built from
-the checked-in schemas. Protocol compatibility, Python/Rust conformance, hosted CI, supply-chain
-provenance, and representative performance characterization remain release gates. This is a
-pre-release implementation, not a production certification.
+## Release validation
 
-Licensed under Apache-2.0.
-
-## Production validation
-
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Run `cargo test --locked`, Clippy with warnings denied, the release build, and Python/Core
+cross-language conformance. Test a dedicated Core host with representative processors for
+cancellation, overload/backpressure, malformed messages, process restart, shutdown during work,
+and error sanitization. Hosted CI, provenance, live deployment, and representative production
+performance remain external release gates.
